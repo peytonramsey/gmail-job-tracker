@@ -1,0 +1,536 @@
+# Phase I: fetch and parse Gmail inbox
+
+## Imports
+```{python}
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+import os
+import pandas as pd
+```
+
+## Authenticate with Gmail API
+```{python}
+SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+
+creds = None
+if os.path.exists('token.json'):
+    creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+
+if not creds or not creds.valid:
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+        creds = flow.run_local_server(port=0)
+    with open('token.json', 'w') as token:
+        token.write(creds.to_json())
+
+service = build('gmail', 'v1', credentials=creds)
+```
+
+## Fetch all Primary inbox message IDs
+```{python}
+messages = []
+page_token = None
+
+while True:
+    results = service.users().messages().list(
+        userId='me',
+        q='in:inbox category:primary',
+        maxResults=500,
+        pageToken=page_token
+    ).execute()
+    messages.extend(results.get('messages', []))
+    page_token = results.get('nextPageToken')
+    if not page_token:
+        break
+
+print(f'Found {len(messages)} messages')
+```
+
+## Fetch message details and build DataFrame
+```{python}
+import time
+import socket
+from ssl import SSLEOFError
+
+def fetch_message(service, msg_id, retries=5):
+    for attempt in range(retries):
+        try:
+            return service.users().messages().get(
+                userId='me',
+                id=msg_meta['id'],
+                format='metadata',
+                metadataHeaders=['Date', 'From', 'Subject', 'Reply-To', 'Sender']
+            ).execute()
+        except (SSLEOFError, socket.error, ConnectionResetError, OSError):
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                raise
+
+rows = []
+for i, msg_meta in enumerate(messages):
+    msg = fetch_message(service, msg_meta['id'])
+    headers = {h['name']: h['value'] for h in msg['payload']['headers']}
+    rows.append({
+        'MsgId': msg_meta['id'],
+        'Date': headers.get('Date', ''),
+        'From': headers.get('From', ''),
+        'Subject': headers.get('Subject', ''),
+        'Reply-To': headers.get('Reply-To', ''),
+        'Sender': headers.get('Sender', ''),
+        'Snippet': msg.get('snippet', ''),
+    })
+    if i % 100 == 0:
+        print(f'Processed {i}/{len(messages)}')
+        pd.DataFrame(rows).to_csv('email_df_checkpoint.csv', index=False)
+
+email_df = pd.DataFrame(rows)
+email_df.to_csv('email_df_checkpoint.csv', index=False)
+print(f'Done. {len(email_df)} emails loaded.')
+
+```
+
+## Preview
+```{python}
+email_df.head()
+```
+
+# Phase II: classify emails
+
+## PydanticAI Setup
+```{python}
+import asyncio, re, base64, yaml, os
+import nest_asyncio
+from pydantic import BaseModel, Field
+from typing import Literal
+from pydantic_ai import Agent
+
+nest_asyncio.apply()
+with open('.yaml') as f:
+    _cfg = yaml.safe_load(f)
+os.environ['GROQ_API_KEY'] = _cfg['groq_api_key']
+
+class JobEmailDetails(BaseModel):
+    company_name: str | None = Field(default=None)
+    job_title: str | None = Field(default=None)
+    status: Literal[
+        "applied", "interview", "assessment", "offer",
+        "rejected", "withdrawn", "unknown"
+    ] = "unknown"
+    confidence: float = Field(ge=0, le=1)
+    evidence_snippets: list[str] = Field(default_factory=list)
+
+extraction_agent = Agent('groq:llama-3.1-8b-instant', output_type=JobEmailDetails,
+system_prompt="""Extract job application details from recruiting emails.
+Rules:
+- Only extract company_name if it appears verbatim in the provided text.
+- evidence_snippets must be exact substrings copied from the email text.
+- Return null rather than guessing.
+- status reflects the current application stage, not just keywords."""
+)
+
+# Job title keywords for the user's target domain — extend as needed
+TITLE_KW = re.compile(
+    r'\b((?:senior|junior|lead|principal|staff|associate)\s+)?'
+    r'(data\s+(?:scientist|analyst|engineer|science|architect)|'
+    r'machine\s+learning(?:\s+engineer)?|ml\s+engineer|ai\s+engineer|'
+    r'software\s+(?:engineer|developer)|research\s+scientist|applied\s+scientist|'
+    r'(?:backend|front[\s\-]?end|full[\s\-]?stack)\s+(?:engineer|developer)|'
+    r'analytics\s+engineer|platform\s+engineer|cloud\s+engineer|'
+    r'devops\s+engineer|quantitative\s+analyst|business\s+analyst|'
+    r'product\s+(?:manager|analyst))\b',
+    re.I
+)
+
+TITLE_PHRASE_PATS = [
+    re.compile(
+        r'(?:applied\s+for|application\s+for|applying\s+for|your\s+application\s+(?:for|to))'
+        r'\s+(?:the\s+)?(?:position\s+of\s+)?([A-Za-z][A-Za-z0-9 ,\-/()]{3,70})'
+        r'(?=\s+(?:at|with|position|role)|[,.\n]|$)', re.I),
+    re.compile(
+        r'(?:position|role|job\s+title|title|opening)\s*[:\-]\s*'
+        r'([A-Za-z][A-Za-z0-9 ,\-/()]{3,70})(?=[,.\n]|$)', re.I),
+]
+
+def extract_title_from_text(text):
+    """Try phrase patterns first (more precise), then direct keyword match."""
+    for pat in TITLE_PHRASE_PATS:
+        m = pat.search(text)
+        if m:
+            candidate = m.group(1).strip()
+            if TITLE_KW.search(candidate):
+                return candidate.title()
+    m = TITLE_KW.search(text)
+    if m:
+        return m.group(0).strip().title()
+    return None
+```
+
+## Filter
+```{python}
+strong_pattern = re.compile(
+    r'\b(application|interview|offer|rejection|assessment|background\s+check|reference\s+check|phone\s*screen|candidate\s+survey|thank\s+you\s+for\s+apply\w*)\b',
+    re.I
+)
+medium_pattern = re.compile(
+    r'\b(job|role|position|opportunity|candidate|candidacy|hiring|recruit(?:er|ing|ment)?|availability|schedule|reschedule|next\s+steps|status\s+update|interest)\b',
+    re.I
+)
+ats_pattern = re.compile(
+    r'workday|greenhouse|lever|taleo|icims|jobvite|smartrecruiters',
+    re.I
+)
+
+def job_email_score(row):
+    subject = str(row.get('Subject', ''))
+    from_ = str(row.get('From', ''))
+    snippet = str(row.get('Snippet', ''))
+    text = f"{subject} {snippet}"
+    strong = bool(strong_pattern.search(text))
+    medium_count = len(medium_pattern.findall(text))
+    ats = bool(ats_pattern.search(from_))
+    score = (2 if strong else 0) + medium_count + (1 if ats else 0)
+    return score, ats
+
+email_df[['FilterScore', 'IsATS']] = email_df.apply(
+    lambda row: pd.Series(job_email_score(row)), axis=1
+)
+
+definite = email_df[email_df['FilterScore'] >= 2].copy()
+maybe = email_df[(email_df['FilterScore'] == 1) | ((email_df['FilterScore'] == 0) & email_df['IsATS'])].copy()
+print(f'Definite: {len(definite)} | Maybe (borderline): {len(maybe)}')
+
+confirmed_maybe = maybe[maybe.apply(
+    lambda row: bool(TITLE_KW.search(f"{row['Subject']} {row['Snippet']}")), axis=1
+)].copy()
+
+job_emails = pd.concat([definite, confirmed_maybe]).copy()
+print(f'After filter: {len(job_emails)} job emails ({len(confirmed_maybe)} confirmed from maybe tier)')
+job_emails.head()
+```
+
+## Extract job details
+```{python}
+# company name, job title, date, status
+import re
+from email.utils import parseaddr
+
+try:
+    import tldextract
+except ImportError:
+    tldextract = None
+
+
+GENERIC_TOKENS = {
+    'noreply', 'no-reply', 'donotreply', 'do-not-reply', 'notifications',
+    'notification', 'hiring', 'jobs', 'job', 'careers', 'career', 'bounce',
+    'mailer', 'postmaster', 'info', 'support', 'hello', 'team', 'recruiting',
+    'recruiter', 'talent', 'hr', 'people', 'mail', 'email', 'updates', 'gmail'
+}
+
+ATS_ROOTS = {
+    'workday', 'myworkday', 'myworkdayjobs',
+    'greenhouse', 'lever', 'taleo', 'icims',
+    'jobvite', 'smartrecruiters'
+}
+
+
+def clean_company_token(token: str):
+    if not token:
+        return None
+
+    token = token.strip().lower()
+    token = re.sub(r'[^a-z0-9&.\- ]+', ' ', token)
+    token = re.sub(r'\s+', ' ', token).strip()
+
+    if not token or token in GENERIC_TOKENS:
+        return None
+
+    # remove common junk words around a company-like token
+    junk_words = {
+        'careers', 'career', 'jobs', 'job', 'recruiting', 'recruiter',
+        'talent', 'team', 'notifications', 'notification', 'mail',
+        'mailer', 'support', 'info', 'hello', 'hr', 'people'
+    }
+    parts = [p for p in re.split(r'[\s._\-]+', token) if p and p not in junk_words]
+    if not parts:
+        return None
+
+    cleaned = " ".join(parts)
+    if len(cleaned) < 2:
+        return None
+
+    return cleaned.title()
+
+
+def get_domain_parts(domain: str):
+    domain = domain.lower().strip()
+
+    if tldextract:
+        ext = tldextract.extract(domain)
+        root = ext.domain
+        subdomains = [p for p in ext.subdomain.split('.') if p]
+        suffix = ext.suffix
+        return root, subdomains, suffix
+
+    parts = domain.split('.')
+    if len(parts) >= 2:
+        root = parts[-2]
+        subdomains = parts[:-2]
+        suffix = parts[-1]
+        return root, subdomains, suffix
+
+    return domain, [], ''
+
+
+def add_candidate(candidates, value, score, source):
+    cleaned = clean_company_token(value)
+    if cleaned:
+        candidates.append((cleaned, score, source))
+
+
+def extract_from_headers(header_value, candidates):
+    display_name, addr = parseaddr(str(header_value or ''))
+
+    if display_name and '@' not in display_name:
+        add_candidate(candidates, display_name, 100, 'display_name')
+
+    if not addr or '@' not in addr:
+        return
+
+    local, domain = addr.lower().split('@', 1)
+    root, subdomains, _ = get_domain_parts(domain)
+
+    # direct company domain
+    if root and root not in ATS_ROOTS:
+        add_candidate(candidates, root, 90, 'root_domain')
+
+    # ATS domain: local part may be the company
+    if root in ATS_ROOTS:
+        add_candidate(candidates, local, 85, 'ats_local_part')
+
+    # branded subdomain or relay
+    for sub in reversed(subdomains):
+        if sub not in ATS_ROOTS and sub not in GENERIC_TOKENS:
+            add_candidate(candidates, sub, 75, 'subdomain')
+
+    # non-ATS local part can still be useful if it looks branded
+    if local not in GENERIC_TOKENS and root in ATS_ROOTS:
+        add_candidate(candidates, local, 80, 'ats_local_part')
+    elif local not in GENERIC_TOKENS and '.' not in local:
+        add_candidate(candidates, local, 40, 'local_part')
+
+
+def extract_from_text(text, candidates, base_score):
+    text = str(text or '')
+
+    patterns = [
+        r'(?:position|role)\s+[A-Za-z0-9\s\,]+\s+at\s+([A-Z][A-Za-z0-9&.\'\- ]{1,40})',
+        r'(?:application|interview|opportunity|position|role|update|next steps|candidacy)\s+(?:at|with|for|from)\s+([A-Z][A-Za-z0-9&.\'\- ]{1,40})',
+        r'(?:to|from|with|at)\s+([A-Z][A-Za-z0-9&.\'\- ]{1,40})(?:\s*[,!:\-]|$)',
+        r'your application to\s+([A-Z][A-Za-z0-9&.\'\- ]{1,40})',
+        r'thank you for applying to\s+([A-Z][A-Za-z0-9&.\'\- ]{1,40})',
+        r'interest in\s+([A-Z][A-Za-z0-9&.\'\- ]{1,40})'
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            add_candidate(candidates, match.group(1), base_score, 'text_pattern')
+
+
+def choose_best_candidate(candidates):
+    if not candidates:
+        return None, None, 0
+
+    best_by_name = {}
+    for name, score, source in candidates:
+        if name not in best_by_name or score > best_by_name[name][0]:
+            best_by_name[name] = (score, source)
+
+    best_name = max(best_by_name.items(), key=lambda x: x[1][0])
+    return best_name[0], best_name[1][1], best_name[1][0]
+
+
+def extract_company(row):
+    candidates = []
+
+    for field in ['From', 'Reply-To', 'Sender']:
+        extract_from_headers(row.get(field, ''), candidates)
+
+    extract_from_text(row.get('Subject', ''), candidates, 70)
+
+    company, source, score = choose_best_candidate(candidates)
+    return company, score
+
+job_emails[['Company', 'ExtractScore']] = job_emails.apply(
+    lambda row: pd.Series(extract_company(row)), axis=1
+)
+job_emails['Date'] = pd.to_datetime(job_emails['Date'], errors='coerce', utc = True)
+job_emails['Status'] = job_emails['Subject'].apply(lambda x: (
+    'Offer'     if any(w in x.lower() for w in ['offer', 'pleased to', 'congratulations']) else
+    'Interview' if any(w in x.lower() for w in ['interview', 'schedule', 'next steps']) else
+    'Rejected'  if any(w in x.lower() for w in ['unfortunately', 'other candidates', 'not moving forward', 'not selected']) else
+    'Applied'   if any(w in x.lower() for w in ['application', 'applied', 'received', 'thank you for applying']) else
+    'Other'
+))
+
+noise_pattern = re.compile(
+    r'\b(reset\s+your\s+password|verify\s+your\s+(email|account)|security\s+alert|confirm\s+your\s+email|email\s+verification|unsubscribe\s+confirmation)\b',
+    re.I
+)
+before = len(job_emails)
+job_emails = job_emails[~job_emails['Subject'].str.contains(noise_pattern, na=False)].copy()
+print(f'Removed {before - len(job_emails)} false-positive emails (password resets, verifications, etc.)')
+print(f'{len(job_emails)} job emails ready for extraction')
+job_emails[['Date', 'Company', 'Subject', 'Status']].head(10)
+
+```
+
+# Phase III: PydanticAI extraction
+
+## Run AI extraction
+```{python}
+async def process_batch(rows, concurrency=20):
+    semaphore = asyncio.Semaphore(concurrency)
+    results = {}
+
+    async def process_one(idx, row):
+        source = f"{row['From']} {row['Subject']} {row['Snippet']}"
+        prompt = f"From: {row['From']}\nSubject: {row['Subject']}\nSnippet: {row['Snippet']}"
+        async with semaphore:
+            try:
+                result = await extraction_agent.run(prompt)
+                d = result.output
+                d.evidence_snippets = [s for s in d.evidence_snippets if s.lower() in source.lower()]
+                if d.company_name and d.company_name.lower() not in source.lower():
+                    d.company_name = None
+                results[idx] = d
+            except Exception as e:
+                print(f"Error on row {idx}: {e}")
+                results[idx] = None
+
+    await asyncio.gather(*[process_one(idx, row) for idx, row in rows.iterrows()])
+    return results
+
+job_emails['JobTitle'] = None
+job_emails['Confidence'] = None
+
+print(f'Sending {len(job_emails)} rows to extraction_agent...')
+ai_results = asyncio.run(process_batch(job_emails))
+
+for idx, details in ai_results.items():
+    if details is None:
+        continue
+    if details.company_name:
+        job_emails.loc[idx, 'Company'] = details.company_name
+    job_emails.loc[idx, 'JobTitle'] = details.job_title
+    if details.status != 'unknown':
+        job_emails.loc[idx, 'Status'] = details.status.capitalize()
+    job_emails.loc[idx, 'Confidence'] = details.confidence
+
+# Regex pass: fill null titles from Subject+Snippet (no tokens used)
+for idx, row in job_emails[job_emails['JobTitle'].isna()].iterrows():
+    title = extract_title_from_text(f"{row['Subject']} {row['Snippet']}")
+    if title:
+        job_emails.loc[idx, 'JobTitle'] = title
+
+print(f'After AI + regex Subject pass: {job_emails["JobTitle"].notna().sum()} / {len(job_emails)} titles found')
+job_emails[['Date', 'Company', 'JobTitle', 'Status', 'Confidence']].head(10)
+```
+
+## Fetch bodies for null-JobTitle rows
+```{python}
+def extract_body_text(payload, max_chars=3000):
+    mime_type = payload.get('mimeType', '')
+    if mime_type == 'text/plain':
+        data = payload.get('body', {}).get('data', '')
+        if data:
+            return base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')[:max_chars]
+    elif mime_type.startswith('multipart/'):
+        for part in payload.get('parts', []):
+            text = extract_body_text(part, max_chars)
+            if text:
+                return text
+    return ''
+
+# Build index → MsgId map using the 'messages' list from Phase I
+msg_id_map = {}
+if 'messages' in vars() and 'email_df' in vars() and len(messages) == len(email_df):
+    msg_id_map = {i: messages[i]['id'] for i in range(len(messages))}
+    print(f"MsgId map built from Phase I: {len(msg_id_map)} entries")
+else:
+    print("'messages' not available or size mismatch — re-run Phase I to enable body fetching")
+
+null_title = job_emails[job_emails['JobTitle'].isna() & job_emails['Company'].notna()]
+print(f"Null-JobTitle rows with known company: {len(null_title)}")
+
+def fetch_body_with_retry(msg_id, retries=3):
+    for attempt in range(retries):
+        try:
+            full_msg = service.users().messages().get(
+                userId='me', id=msg_id, format='full'
+            ).execute()
+            return extract_body_text(full_msg.get('payload', {}))
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    return ''
+
+# Phase 1: fetch bodies sequentially (httplib2 is not thread-safe)
+bodies = {}
+for i, (idx, row) in enumerate(null_title.iterrows()):
+    if i % 100 == 0:
+        print(f"  Fetching body {i}/{len(null_title)}...")
+    msg_id = msg_id_map.get(idx)
+    if not msg_id:
+        continue
+    body = fetch_body_with_retry(msg_id)
+    if body:
+        bodies[idx] = body
+
+print(f"Fetched {len(bodies)} / {len(null_title)} bodies")
+
+# Regex pass on body text — no AI, no token cost
+updated = 0
+for idx, body in bodies.items():
+    title = extract_title_from_text(body[:1000])  # title is always near the top
+    if title:
+        job_emails.loc[idx, 'JobTitle'] = title
+        updated += 1
+
+print(f"Body regex pass: updated {updated} / {len(null_title)} rows")
+fill_rate = job_emails['JobTitle'].notna().mean()
+print(f"Total fill rate: {job_emails['JobTitle'].notna().sum()} / {len(job_emails)} ({fill_rate:.1%})")
+```
+
+## Merge and deduplicate
+```{python}
+status_rank = {'Offer': 4, 'Interview': 3, 'Rejected': 2, 'Applied': 1, 'Other': 0, 'Unknown': 0}
+job_emails['StatusRank'] = job_emails['Status'].map(status_rank).fillna(0)
+
+known = job_emails[job_emails['Company'].notna() & job_emails['JobTitle'].notna()]
+known = known.sort_values('StatusRank', ascending=False).drop_duplicates(subset=['Company', 'JobTitle'], keep='first')
+unknown = job_emails[job_emails['Company'].isna() | job_emails['JobTitle'].isna()]
+
+job_emails = (
+    pd.concat([known, unknown])
+      .drop(columns='StatusRank')
+      .sort_values('Date', ascending=False)
+)
+
+print(f'{len(job_emails)} unique applications after deduplication')
+job_emails[['Date', 'Company', 'JobTitle', 'Status', 'Confidence']].head(10)
+```
+
+## Export
+```{python}
+job_emails[['Date', 'Company', 'JobTitle', 'Subject', 'Status', 'Confidence']].to_csv('job_tracker.csv', index=False)
+print('Saved to job_tracker.csv')
+```
+
+
