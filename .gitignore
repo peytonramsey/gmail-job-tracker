@@ -1,0 +1,13 @@
+# Credentials and secrets — never commit these
+.yaml
+credentials.json
+token.json
+
+# Pipeline output files
+*.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.env
