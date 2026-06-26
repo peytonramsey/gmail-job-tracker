@@ -38,7 +38,7 @@ page_token = None
 while True:
     results = service.users().messages().list(
         userId='me',
-        q='in:inbox category:primary',
+        q='in:inbox category:primary (interview OR "offer letter" OR "job offer" OR "background check" OR "phone screen" OR "thank you for applying" OR "your application" OR assessment OR recruiter OR recruiting OR workday OR greenhouse OR lever OR taleo OR icims OR jobvite OR smartrecruiters)',
         maxResults=500,
         pageToken=page_token
     ).execute()
@@ -380,7 +380,18 @@ job_emails['Status'] = job_emails['Subject'].apply(lambda x: (
 ))
 
 noise_pattern = re.compile(
-    r'\b(reset\s+your\s+password|verify\s+your\s+(email|account)|security\s+alert|confirm\s+your\s+email|email\s+verification|unsubscribe\s+confirmation)\b',
+    r'\b('
+    # account / security noise
+    r'reset\s+your\s+password|verify\s+your\s+(email|account)|security\s+alert'
+    r'|confirm\s+your\s+email|email\s+verification|unsubscribe\s+confirmation'
+    # college / university noise
+    r'|scholarship|college\s+appli\w*|university\s+appli\w*|admission(?:s)?'
+    r'|enrollment|tuition|campus|semester|freshman|financial\s+aid'
+    r'|application\s+(?:deadline|fee|portal)|apply\s+to\s+college'
+    r'|cross\s+country|track\s+and\s+field|athletic(?:s)?'
+    # generic marketing that slips through
+    r'|don.t\s+miss\s+out|last\s+chance\s+to\s+apply|spots?\s+(?:are\s+)?filling'
+    r')\b',
     re.I
 )
 before = len(job_emails)
@@ -534,3 +545,189 @@ print('Saved to job_tracker.csv')
 ```
 
 
+# Phase IV: Creating the UI with charts and summary's
+
+## Three directions to go:
+
+1. Analytics: response rate, interview rate, offer rate, time-to-response, time-in-stage, applications by role/company/month, and funnel views such as sankey-style status flow. Existing trackers highlight exactly these metrics because they help users see what is and is not working.
+
+2. Workflow: follow-up reminders, next-action dates, duplicate detection, contact tracking, notes, and interview logs. Competing tools repeatedly focus on reminders and task management, which suggests users want a system that helps them move applications forward, not just archive them.
+
+3. Automation/productization: Gmail sync, hourly refresh, exports, local database storage, GitHub Actions, and maybe a small dashboard. Open-source projects already automate inbox processing and scheduled updates, which makes this a realistic path for your repo too.
+
+## best ideas to build upon:
+
+- Follow-up engine: flag applications with no reply after 7, 14, or 21 days and create a “needs attention” list. Reminder-driven trackers are common, which suggests this is genuinely useful rather than gimmicky.
+
+- Source effectiveness tracker: add a source column later, like LinkedIn, company site, Greenhouse, referral, and measure which sources produce interviews. Competing products highlight source and platform performance because it changes user behavior.
+
+- Role clustering: normalize titles into buckets like software engineer, data analyst, product, internship, then compare outcomes by bucket. That gives a more strategic view than just counting raw titles. 
+
+## Follow-up engine
+```{python}
+# load job_tracker.csv
+job_emails = pd.read_csv('job_tracker.csv')
+
+# keep only rows where status == 'Applied'
+job_emails = job_emails[job_emails['Status'] == 'Applied']
+
+# calculate days_since = today - Date
+job_emails['Date'] = pd.to_datetime(job_emails['Date'])
+job_emails['Date'] = job_emails['Date'].dt.tz_convert(None)
+now = pd.Timestamp.now()
+
+job_emails['days_since'] = (now - job_emails['Date']).dt.days
+
+# bucket into 7, 14, 21 day intervals; drop anything over 90 days
+job_emails = job_emails[(job_emails['days_since'] >= 7) & (job_emails['days_since'] <= 90)]
+job_emails['days_since_bucket'] = pd.cut(job_emails['days_since'], bins=[0, 7, 14, 21, 90], labels=['1-7', '8-14', '15-21', '22-90'])
+
+# print the "needs attention" list sorted by most overdue
+print(job_emails[['Company', 'JobTitle', 'Date', 'days_since', 'days_since_bucket']].sort_values('days_since', ascending=False))
+```
+
+## Analytics
+```{python}
+df = pd.read_csv('job_tracker.csv')
+df['Date'] = pd.to_datetime(df['Date']).dt.tz_convert(None)
+
+# response rate
+any_response_rate = df['Status'].isin(['Interview', 'Offer', 'Rejected']).sum() / len(df)
+print(f'Any response rate: {any_response_rate:.2%}')
+
+# funnel, applied to interview to offer, etc
+funnel = df['Status'].value_counts()
+print(funnel)
+
+# applications by month
+applications_by_month = df.groupby(df['Date'].dt.to_period('M')).size()
+print(applications_by_month)
+```
+
+## Role clustering
+```{python}
+# normalize titles into buckets (Data Science, SWE, Analytics, etc)
+import numpy as np
+
+title = df['JobTitle'].str.lower().fillna('')
+
+conditions = [
+    title.str.contains('data scientist|machine learning|ml engineer|ai engineer|research scientist', na=False),
+    title.str.contains('software engineer|backend|frontend|full.?stack|developer', na=False),
+    title.str.contains('data analyst|analytics engineer|business analyst|quantitative', na=False),
+    title.str.contains('product manager|product analyst', na=False),
+    title.str.contains('data engineer|platform engineer|cloud engineer|devops', na=False),
+]
+choices = ['Data Science / ML', 'Software Engineering', 'Analytics', 'Product', 'Data Engineering']
+
+df['Role'] = np.select(conditions, choices, default='Other')
+print(df['Role'].value_counts())
+```
+
+## Visuals (bar chart / funnel chart / line chart)
+```{python}
+import plotly.graph_objects as go
+
+# Bar chart: applications by role cluster
+role_counts = df['Role'].value_counts()
+fig_roles = go.Figure(data=[go.Bar(
+    x=role_counts.index,
+    y=role_counts.values,
+    text=role_counts.values,
+    textposition='auto'
+)])
+fig_roles.update_layout(title='Applications by Role Cluster', xaxis_title='Role', yaxis_title='Count')
+fig_roles.show()
+
+# Funnel chart: status progression (Applied → Interview → Offer)
+status_order = ['Applied', 'Interview', 'Assessment', 'Offer', 'Rejected']
+status_counts = df['Status'].value_counts().reindex(status_order).dropna()
+fig_funnel = go.Figure(data=[go.Funnel(
+    y=status_counts.index,
+    x=status_counts.values,
+    textinfo='value+percent initial'
+)])
+fig_funnel.update_layout(title='Application Funnel')
+fig_funnel.show()
+
+# Line chart: applications submitted per month
+applications_by_month = df.groupby(df['Date'].dt.to_period('M')).size()
+fig_months = go.Figure(data=[go.Scatter(
+    x=applications_by_month.index.astype(str),
+    y=applications_by_month.values,
+    mode='lines+markers',
+    hovertemplate='%{x}: %{y} applications<extra></extra>'
+)])
+fig_months.update_layout(title='Applications by Month', xaxis_title='Month', yaxis_title='Count')
+fig_months.show()
+```
+
+## Markdown weekly report
+```{python}
+from IPython.display import Markdown
+from datetime import timedelta
+
+df = pd.read_csv('job_tracker.csv')
+df['Date'] = pd.to_datetime(df['Date']).dt.tz_convert(None)
+
+today = pd.Timestamp.now()
+week_ago = today - timedelta(days=7)
+
+# counts
+total        = len(df)
+this_week    = (df['Date'] >= week_ago).sum()
+interviews   = (df['Status'] == 'Interview').sum()
+offers       = (df['Status'] == 'Offer').sum()
+rejected     = (df['Status'] == 'Rejected').sum()
+pending      = (df['Status'] == 'Applied').sum()
+any_response = df['Status'].isin(['Interview', 'Offer', 'Rejected']).sum()
+response_rate = any_response / total if total > 0 else 0
+overdue      = ((df['Status'] == 'Applied') & ((today - df['Date']).dt.days >= 14)).sum()
+
+report = f"""
+# Job Search Report: {today.strftime('%B %d, %Y')}
+
+## This Week
+- Applications sent: **{this_week}**
+
+## Overall Pipeline
+| Stage | Count |
+|---|---|
+| Total applications | {total} |
+| Interviews | {interviews} |
+| Offers | {offers} |
+| Rejections | {rejected} |
+| Pending (no reply) | {pending} |
+
+**Response rate: {response_rate:.1%}**
+
+## Needs Attention
+- {overdue} applications with no reply in 14+ days
+"""
+
+display(Markdown(report))
+fig_roles.show()
+fig_funnel.show()
+fig_months.show()
+```
+
+
+
+
+# EDA
+trying to figure out why there are so many "Other" roles
+
+```{python}
+df = pd.read_csv('job_tracker.csv')
+
+# view total applications from 2025 to 2026
+total_applications = len(df[(df['Date'] >= '2025-01-01') & (df['Date'] <= '2026-12-31')])
+print(f"Total applications from 2025 to 2026: {total_applications}")
+
+df.sample(10)
+
+
+# view "Other" role applications
+other_role_apps = df[df['Role'] == 'Other']
+print(f"'Other' role applications: {len(other_role_apps)}")
+```
