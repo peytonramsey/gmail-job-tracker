@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 # Credentials and secrets 
+=======
+# Creds and secrets
+>>>>>>> 9498d72dc904f3ce3e23146631ddb0cca1853d4d
 .yaml
 credentials.json
 token.json

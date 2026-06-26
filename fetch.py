@@ -1,53 +1,30 @@
 # Phase I: hits Gmail API, saves email_df_checkpoint.csv
 
-## Imports
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-import os
-import pandas as pd
-
-## Authenticate with Gmail API
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-
-creds = None
-if os.path.exists('token.json'):
-    creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-
-if not creds or not creds.valid:
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    else:
-        flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-        creds = flow.run_local_server(port=0)
-    with open('token.json', 'w') as token:
-        token.write(creds.to_json())
-
-service = build('gmail', 'v1', credentials=creds)
-
-## Fetch all Primary inbox message IDs
-messages = []
-page_token = None
-
-while True:
-    results = service.users().messages().list(
-        userId='me',
-        q='in:inbox category:primary (interview OR "offer letter" OR "job offer" OR "background check" OR "phone screen" OR "thank you for applying" OR "your application" OR assessment OR recruiter OR recruiting OR workday OR greenhouse OR lever OR taleo OR icims OR jobvite OR smartrecruiters)',
-        maxResults=500,
-        pageToken=page_token
-    ).execute()
-    messages.extend(results.get('messages', []))
-    page_token = results.get('nextPageToken')
-    if not page_token:
-        break
-
-print(f'Found {len(messages)} messages')
-
-## Fetch message details and build DataFrame
 import time
 import socket
 from ssl import SSLEOFError
+import pandas as pd
+from auth import get_gmail_service
+from patterns import ATS_PROVIDERS
+
+CHECKPOINT_INTERVAL = 100
+
+# Job-signal keywords; ATS provider names are appended from the shared list.
+JOB_QUERY_TERMS = [
+    'interview',
+    '"offer letter"',
+    '"job offer"',
+    '"background check"',
+    '"phone screen"',
+    '"thank you for applying"',
+    '"your application"',
+    'assessment',
+    'recruiter',
+    'recruiting',
+]
+GMAIL_QUERY_TERMS = JOB_QUERY_TERMS + list(ATS_PROVIDERS)
+GMAIL_QUERY = f'in:inbox category:primary ({" OR ".join(GMAIL_QUERY_TERMS)})'
+
 
 def fetch_message(service, msg_id, retries=5):
     for attempt in range(retries):
@@ -64,23 +41,48 @@ def fetch_message(service, msg_id, retries=5):
             else:
                 raise
 
-rows = []
-for i, msg_meta in enumerate(messages):
-    msg = fetch_message(service, msg_meta['id'])
-    headers = {h['name']: h['value'] for h in msg['payload']['headers']}
-    rows.append({
-        'MsgId': msg_meta['id'],
-        'Date': headers.get('Date', ''),
-        'From': headers.get('From', ''),
-        'Subject': headers.get('Subject', ''),
-        'Reply-To': headers.get('Reply-To', ''),
-        'Sender': headers.get('Sender', ''),
-        'Snippet': msg.get('snippet', ''),
-    })
-    if i % 100 == 0:
-        print(f'Processed {i}/{len(messages)}')
-        pd.DataFrame(rows).to_csv('email_df_checkpoint.csv', index=False)
 
-email_df = pd.DataFrame(rows)
-email_df.to_csv('email_df_checkpoint.csv', index=False)
-print(f'Done. {len(email_df)} emails loaded.')
+def parse_message_row(msg_meta, msg):
+    headers = {h['name']: h['value'] for h in msg['payload']['headers']}
+    return {
+        'MsgId':    msg_meta['id'],
+        'Date':     headers.get('Date', ''),
+        'From':     headers.get('From', ''),
+        'Subject':  headers.get('Subject', ''),
+        'Reply-To': headers.get('Reply-To', ''),
+        'Sender':   headers.get('Sender', ''),
+        'Snippet':  msg.get('snippet', ''),
+    }
+
+
+if __name__ == '__main__':
+    service = get_gmail_service()
+
+    messages = []
+    page_token = None
+
+    while True:
+        results = service.users().messages().list(
+            userId='me',
+            q=GMAIL_QUERY,
+            maxResults=500,
+            pageToken=page_token
+        ).execute()
+        messages.extend(results.get('messages', []))
+        page_token = results.get('nextPageToken')
+        if not page_token:
+            break
+
+    print(f'Found {len(messages)} messages')
+
+    rows = []
+    for i, msg_meta in enumerate(messages):
+        msg = fetch_message(service, msg_meta['id'])
+        rows.append(parse_message_row(msg_meta, msg))
+        if i % CHECKPOINT_INTERVAL == 0:
+            print(f'Processed {i}/{len(messages)}')
+            pd.DataFrame(rows).to_csv('email_df_checkpoint.csv', index=False)
+
+    email_df = pd.DataFrame(rows)
+    email_df.to_csv('email_df_checkpoint.csv', index=False)
+    print(f'Done. {len(email_df)} emails loaded.')
