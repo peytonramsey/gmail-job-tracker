@@ -1,4 +1,4 @@
-# Credentials and secrets — never commit these
+# Credentials and secrets 
 .yaml
 credentials.json
 token.json
